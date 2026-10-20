@@ -1397,6 +1397,7 @@ class IncidenceBasedRegressionTask(RegressionTask):
         cost: str = "old",
         incidence_task_name: str = "incidence",
         class_prob_task_name: str = "classification",
+        charged_classes: list[int] | None = None,
     ):
         """Construct proxy particles from predicted incidence matrix, and then correct the proxies using a regression.
 
@@ -1457,6 +1458,13 @@ class IncidenceBasedRegressionTask(RegressionTask):
         self.incidence_task_name = incidence_task_name
         self.incidence_output_key = f"{output_object}_incidence"
         self.class_prob_task_name = class_prob_task_name
+        # Class indices whose proxy features come from the track branch (needs <input_constituent>_is_track == 1
+        # nodes). Default [0, 1, 2] reproduces the PFlow convention (charged hadron / electron / muon). For inputs
+        # without tracks (e.g. HGCAL tracksters) pass [] so that every query uses the neutral (energy-weighted)
+        # branch regardless of its predicted class; otherwise a query declared valid gets zero proxy features
+        # and the regression loss drives the classification head towards predicting null.
+        self.charged_classes = list(range(3)) if charged_classes is None else list(charged_classes)
+        self.register_buffer("_charged_class_idx", torch.tensor(self.charged_classes, dtype=torch.long), persistent=False)
         self.class_prob_output_key = f"{output_object}_class_prob"
 
     def forward(self, x: dict[str, Tensor], outputs: dict[str, dict[str, Tensor]] | None = None) -> dict[str, Tensor]:
@@ -1616,8 +1624,12 @@ class IncidenceBasedRegressionTask(RegressionTask):
         zero_track_mask = charged_inc_new.sum(-1, keepdim=True) == 0
         charged_inc = torch.where(zero_track_mask, charged_inc_top2, charged_inc_new)
 
-        # Split charged and neutral
-        is_charged = class_probs.argmax(-1) < 3
+        # Split charged and neutral: charged = predicted class in self.charged_classes ([] -> all neutral)
+        pred_class = class_probs.argmax(-1)
+        if len(self.charged_classes) == 0:
+            is_charged = torch.zeros_like(pred_class, dtype=torch.bool)
+        else:
+            is_charged = torch.isin(pred_class, self._charged_class_idx.to(pred_class.device))
 
         proxy_feats_charged = torch.bmm(charged_inc, proxy_feats)
         proxy_feats_charged[..., 0] = proxy_feats_charged[..., 1] * torch.cosh(proxy_feats_charged[..., 2])
